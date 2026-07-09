@@ -1,127 +1,214 @@
-import socket
-import ssl
-import threading
-import json
+﻿import getpass
 import sys
-import hashlib
-import hmac
-import secrets
 
-HOST = '127.0.0.1'
-PORT = 8443
+from crypto_utils import (
+    decrypt_json,
+    encrypt_json,
+    key_from_text,
+    now_ts,
+    send_request,
+)
+from kerberos_config import (
+    AS_HOST,
+    AS_PORT,
+    SERVICE_HOST,
+    SERVICE_ID,
+    SERVICE_PORT,
+    TGS_HOST,
+    TGS_ID,
+    TGS_PORT,
+)
+from crypto_utils import derive_client_key
 
-# Parâmetros Diffie-Hellman (Num cenário real, seriam gerados dinamicamente ou usar-se-ia um grupo RFC padronizado)
-P = 23  # Primo (simplificado para o exemplo)
-G = 5   # Gerador
 
-shared_secrets = {} # Dicionário para armazenar as chaves HMAC por utilizador
-my_name = ""
+def fail_if_error(response, server_name):
+    if response.get("type") == "ERROR":
+        raise RuntimeError(f"{server_name} retornou erro: {response.get('message')}")
 
-def generate_dh_keys():
-    private_key = secrets.randbelow(P - 2) + 1
-    public_key = pow(G, private_key, P)
-    return private_key, public_key
 
-def calculate_hmac(key, message):
-    # Funcionalidade 4: Mecanismo de verificação de integridade usando HMAC com SHA256
-    return hmac.new(str(key).encode(), message.encode(), hashlib.sha256).hexdigest()
+def request_tgt(client_id, password):
+    print("[CLIENT] Derivando chave do usuario a partir da senha com PBKDF2-HMAC-SHA256...")
+    client_key = derive_client_key(client_id, password)
 
-def receive_messages(conn, my_private_key):
-    while True:
-        try:
-            data = conn.recv(4096)
-            if not data:
+    print("[CLIENT] Enviando AS_REQ para o Servidor de Autenticacao...")
+    response = send_request(
+        AS_HOST,
+        AS_PORT,
+        {
+            "type": "AS_REQ",
+            "client_id": client_id,
+            "tgs_id": TGS_ID,
+        },
+    )
+
+    fail_if_error(response, "AS")
+
+    if response.get("type") != "AS_REP":
+        raise RuntimeError("Resposta inesperada do AS.")
+
+    try:
+        decrypted = decrypt_json(client_key, response["encrypted_for_client"])
+    except Exception as error:
+        raise RuntimeError("Falha ao descriptografar resposta do AS. Usuario ou senha incorretos.") from error
+
+    print("[CLIENT] AS_REP recebida e descriptografada com sucesso.")
+    print("[CLIENT] TGT obtido.")
+
+    return {
+        "client_key": client_key,
+        "client_tgs_session_key": key_from_text(decrypted["client_tgs_session_key"]),
+        "tgt": decrypted["tgt"],
+    }
+
+
+def request_service_ticket(client_id, tgt, client_tgs_session_key):
+    print("[CLIENT] Enviando TGS_REQ para o Ticket Granting Server...")
+
+    authenticator = encrypt_json(
+        client_tgs_session_key,
+        {
+            "client_id": client_id,
+            "timestamp": now_ts(),
+        },
+    )
+
+    response = send_request(
+        TGS_HOST,
+        TGS_PORT,
+        {
+            "type": "TGS_REQ",
+            "service_id": SERVICE_ID,
+            "tgt": tgt,
+            "authenticator": authenticator,
+        },
+    )
+
+    fail_if_error(response, "TGS")
+
+    if response.get("type") != "TGS_REP":
+        raise RuntimeError("Resposta inesperada do TGS.")
+
+    decrypted = decrypt_json(client_tgs_session_key, response["encrypted_for_client"])
+
+    print("[CLIENT] TGS_REP recebida e descriptografada com sucesso.")
+    print("[CLIENT] Ticket de servico obtido.")
+
+    return {
+        "client_service_session_key": key_from_text(decrypted["client_service_session_key"]),
+        "service_ticket": decrypted["service_ticket"],
+    }
+
+
+def send_notes_request(client_id, client_service_session_key, service_ticket, action, note_text=None):
+    timestamp = now_ts()
+
+    authenticator = encrypt_json(
+        client_service_session_key,
+        {
+            "client_id": client_id,
+            "timestamp": timestamp,
+        },
+    )
+
+    encrypted_request = encrypt_json(
+        client_service_session_key,
+        {
+            "action": action,
+            "note_text": note_text,
+        },
+    )
+
+    response = send_request(
+        SERVICE_HOST,
+        SERVICE_PORT,
+        {
+            "type": "SERVICE_REQ",
+            "service_ticket": service_ticket,
+            "authenticator": authenticator,
+            "encrypted_request": encrypted_request,
+        },
+    )
+
+    fail_if_error(response, "Servico de notas")
+
+    if response.get("type") != "SERVICE_REP":
+        raise RuntimeError("Resposta inesperada do servico.")
+
+    decrypted = decrypt_json(client_service_session_key, response["encrypted_for_client"])
+
+    expected_mutual_auth = timestamp + 1
+
+    if decrypted.get("mutual_auth") != expected_mutual_auth:
+        raise RuntimeError("Falha na autenticacao mutua: resposta do servico nao confere.")
+
+    print("[CLIENT] Autenticacao mutua confirmada.")
+    return decrypted["result"]
+
+
+def show_menu():
+    print()
+    print("Escolha uma opcao:")
+    print("1 - Adicionar nota")
+    print("2 - Listar notas")
+    print("0 - Sair")
+
+
+def main():
+    print("Cliente Kerberos - Sistema de Notas")
+    print("-----------------------------------")
+
+    client_id = input("Usuario: ").strip()
+    password = getpass.getpass("Senha: ")
+
+    try:
+        tgt_data = request_tgt(client_id, password)
+
+        service_data = request_service_ticket(
+            client_id=client_id,
+            tgt=tgt_data["tgt"],
+            client_tgs_session_key=tgt_data["client_tgs_session_key"],
+        )
+
+        while True:
+            show_menu()
+            option = input("> ").strip()
+
+            if option == "1":
+                note_text = input("Digite a nota: ").strip()
+
+                result = send_notes_request(
+                    client_id=client_id,
+                    client_service_session_key=service_data["client_service_session_key"],
+                    service_ticket=service_data["service_ticket"],
+                    action="add_note",
+                    note_text=note_text,
+                )
+
+                print(result["message"])
+                print("Notas atuais:", result["notes"])
+
+            elif option == "2":
+                result = send_notes_request(
+                    client_id=client_id,
+                    client_service_session_key=service_data["client_service_session_key"],
+                    service_ticket=service_data["service_ticket"],
+                    action="list_notes",
+                )
+
+                print(result["message"])
+                print("Notas atuais:", result["notes"])
+
+            elif option == "0":
+                print("Encerrando cliente.")
                 break
-            
-            msg = json.loads(data.decode('utf-8'))
-            
-            if msg['type'] == 'list_response':
-                print(f"\n[Utilizadores Online]: {', '.join(msg['users'])}")
-            
-            elif msg['type'] == 'dh_param':
-                # Funcionalidade 3: Receber a chave pública DH e calcular o segredo partilhado
-                sender = msg['from']
-                other_public_key = msg['public_key']
-                shared_secret = pow(other_public_key, my_private_key, P)
-                shared_secrets[sender] = shared_secret
-                print(f"\n[!] Canal seguro estabelecido com {sender}.")
-                
-            elif msg['type'] == 'chat_msg':
-                sender = msg['from']
-                content = msg['content']
-                received_mac = msg['hmac']
-                
-                # Funcionalidade 4 e 5: Verificar a integridade e autenticidade da mensagem
-                if sender not in shared_secrets:
-                    print(f"\n[ALERTA DE SEGURANÇA] Mensagem recebida de {sender} sem canal seguro estabelecido! Autenticidade não verificada.")
-                    continue
-                
-                expected_mac = calculate_hmac(shared_secrets[sender], content)
-                
-                if hmac.compare_digest(expected_mac, received_mac):
-                    print(f"\n[{sender}]: {content}")
-                else:
-                    print(f"\n[ALERTA DE INTEGRIDADE] A mensagem de {sender} foi adulterada durante a transmissão!")
-                    
-        except Exception as e:
-            print(f"Erro na receção: {e}")
-            break
 
-def start_client(cert_file, key_file):
-    global my_name
-    
-    # Configurar mTLS
-    context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
-    context.load_verify_locations("ca.crt")
-    context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            else:
+                print("Opcao invalida.")
 
-    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    secure_conn = context.wrap_socket(conn, server_hostname="ServidorWhatsChat")
-    secure_conn.connect((HOST, PORT))
-    
-    cert = secure_conn.getpeercert()
-    my_name = cert_file.split('.')[0].capitalize()
-    print(f"[*] Login efetuado com sucesso como {my_name}.")
-
-    my_private_key, my_public_key = generate_dh_keys()
-
-    threading.Thread(target=receive_messages, args=(secure_conn, my_private_key), daemon=True).start()
-
-    print("Comandos: '/list' (ver utilizadores), '/connect <nome>' (abrir canal seguro), ou digite a sua mensagem.")
-    current_target = None
-
-    while True:
-        user_input = input("")
-        if user_input == '/list':
-            secure_conn.send(json.dumps({'type': 'list'}).encode())
-        elif user_input.startswith('/connect '):
-            current_target = user_input.split(' ')[1]
-            secure_conn.send(json.dumps({
-                'type': 'dh_param',
-                'from': my_name,
-                'to': current_target,
-                'public_key': my_public_key
-            }).encode())
-            print(f"[*] A iniciar troca de chaves Diffie-Hellman com {current_target}...")
-        elif current_target:
-            if current_target not in shared_secrets:
-                print(f"[-] O canal seguro com {current_target} ainda não foi estabelecido. Aguarde ou reconecte.")
-                continue
-            
-            # Gerar o HMAC e enviar a mensagem
-            msg_hmac = calculate_hmac(shared_secrets[current_target], user_input)
-            secure_conn.send(json.dumps({
-                'type': 'chat_msg',
-                'from': my_name,
-                'to': current_target,
-                'content': user_input,
-                'hmac': msg_hmac
-            }).encode())
-        else:
-            print("[-] Selecione um utilizador primeiro com '/connect <nome>'.")
-
-if __name__ == '__main__':
-    if len(sys.argv) != 3:
-        print("Uso: python client.py <seu_certificado.crt> <sua_chave.key>")
+    except Exception as error:
+        print(f"[ERRO] {error}")
         sys.exit(1)
-    start_client(sys.argv[1], sys.argv[2])
+
+
+if __name__ == "__main__":
+    main()
