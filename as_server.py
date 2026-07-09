@@ -1,7 +1,7 @@
 ﻿import socket
 import traceback
 
-from crypto_utils import encrypt_json, generate_symmetric_key, key_to_text, now_ts, recv_json, send_json
+from crypto_utils import encrypt_json, generate_symmetric_key, is_timestamp_fresh, key_to_text, now_ts, recv_json, send_json
 from kerberos_config import AS_HOST, AS_PORT, KDC_TGS_KEY, TGS_ID, TICKET_LIFETIME_SECONDS, USER_KEYS
 
 
@@ -18,12 +18,19 @@ def handle_as_request(request):
 
     client_id = request.get("client_id")
     requested_tgs_id = request.get("tgs_id")
+    request_timestamp = request.get("timestamp")
 
     if requested_tgs_id != TGS_ID:
         return build_error("TGS solicitado nao existe.")
 
     if client_id not in USER_KEYS:
         return build_error("Usuario nao cadastrado no AS.")
+
+    if request_timestamp is None:
+        return build_error("AS_REQ incompleto: falta timestamp.")
+
+    if not is_timestamp_fresh(request_timestamp):
+        return build_error("AS_REQ antigo ou fora da janela de tempo permitida.")
 
     client_key = USER_KEYS[client_id]
 
@@ -51,6 +58,7 @@ def handle_as_request(request):
             "tgs_id": TGS_ID,
             "client_tgs_session_key": key_to_text(client_tgs_session_key),
             "tgt": tgt,
+            "as_request_timestamp": request_timestamp,
             "issued_at": issued_at,
             "expires_at": expires_at,
         },

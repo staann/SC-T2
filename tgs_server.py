@@ -1,4 +1,5 @@
-﻿import socket
+﻿import json
+import socket
 import traceback
 
 from crypto_utils import (
@@ -23,11 +24,38 @@ from kerberos_config import (
 )
 
 
+USED_AUTHENTICATORS = {}
+
+
 def build_error(message):
     return {
         "type": "ERROR",
         "message": message,
     }
+
+
+def authenticator_fingerprint(encrypted_authenticator):
+    return json.dumps(encrypted_authenticator, sort_keys=True, separators=(",", ":"))
+
+
+def reject_replayed_authenticator(encrypted_authenticator):
+    current_time = now_ts()
+
+    expired_fingerprints = [
+        fingerprint
+        for fingerprint, used_at in USED_AUTHENTICATORS.items()
+        if current_time - used_at > TICKET_LIFETIME_SECONDS
+    ]
+
+    for fingerprint in expired_fingerprints:
+        del USED_AUTHENTICATORS[fingerprint]
+
+    fingerprint = authenticator_fingerprint(encrypted_authenticator)
+
+    if fingerprint in USED_AUTHENTICATORS:
+        raise ValueError("Authenticator repetido. Possivel tentativa de replay.")
+
+    USED_AUTHENTICATORS[fingerprint] = current_time
 
 
 def validate_tgt(tgt):
@@ -41,12 +69,14 @@ def validate_tgt(tgt):
         raise ValueError("TGT expirado.")
 
 
-def validate_authenticator(authenticator, client_id):
+def validate_authenticator(authenticator, client_id, encrypted_authenticator):
     if authenticator.get("client_id") != client_id:
         raise ValueError("Authenticator nao pertence ao mesmo cliente do TGT.")
 
     if not is_timestamp_fresh(authenticator.get("timestamp")):
         raise ValueError("Authenticator antigo ou fora da janela de tempo permitida.")
+
+    reject_replayed_authenticator(encrypted_authenticator)
 
 
 def handle_tgs_request(request):
@@ -72,7 +102,7 @@ def handle_tgs_request(request):
         client_tgs_session_key = key_from_text(tgt["client_tgs_session_key"])
 
         authenticator = decrypt_json(client_tgs_session_key, encrypted_authenticator)
-        validate_authenticator(authenticator, client_id)
+        validate_authenticator(authenticator, client_id, encrypted_authenticator)
 
         issued_at = now_ts()
         expires_at = issued_at + TICKET_LIFETIME_SECONDS

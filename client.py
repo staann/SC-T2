@@ -3,6 +3,7 @@ import sys
 
 from crypto_utils import (
     decrypt_json,
+    derive_client_key,
     encrypt_json,
     key_from_text,
     now_ts,
@@ -18,7 +19,6 @@ from kerberos_config import (
     TGS_ID,
     TGS_PORT,
 )
-from crypto_utils import derive_client_key
 
 
 def fail_if_error(response, server_name):
@@ -38,6 +38,7 @@ def request_tgt(client_id, password):
             "type": "AS_REQ",
             "client_id": client_id,
             "tgs_id": TGS_ID,
+            "timestamp": now_ts(),
         },
     )
 

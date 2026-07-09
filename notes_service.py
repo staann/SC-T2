@@ -1,4 +1,5 @@
-﻿import socket
+﻿import json
+import socket
 import traceback
 
 from crypto_utils import (
@@ -10,10 +11,11 @@ from crypto_utils import (
     recv_json,
     send_json,
 )
-from kerberos_config import SERVICE_HOST, SERVICE_ID, SERVICE_KEY, SERVICE_PORT
+from kerberos_config import SERVICE_HOST, SERVICE_ID, SERVICE_KEY, SERVICE_PORT, TICKET_LIFETIME_SECONDS
 
 
 NOTES_DB = {}
+USED_AUTHENTICATORS = {}
 
 
 def build_error(message):
@@ -21,6 +23,30 @@ def build_error(message):
         "type": "ERROR",
         "message": message,
     }
+
+
+def authenticator_fingerprint(encrypted_authenticator):
+    return json.dumps(encrypted_authenticator, sort_keys=True, separators=(",", ":"))
+
+
+def reject_replayed_authenticator(encrypted_authenticator):
+    current_time = now_ts()
+
+    expired_fingerprints = [
+        fingerprint
+        for fingerprint, used_at in USED_AUTHENTICATORS.items()
+        if current_time - used_at > TICKET_LIFETIME_SECONDS
+    ]
+
+    for fingerprint in expired_fingerprints:
+        del USED_AUTHENTICATORS[fingerprint]
+
+    fingerprint = authenticator_fingerprint(encrypted_authenticator)
+
+    if fingerprint in USED_AUTHENTICATORS:
+        raise ValueError("Authenticator repetido. Possivel tentativa de replay.")
+
+    USED_AUTHENTICATORS[fingerprint] = current_time
 
 
 def validate_service_ticket(ticket):
@@ -34,12 +60,14 @@ def validate_service_ticket(ticket):
         raise ValueError("Ticket de servico expirado.")
 
 
-def validate_authenticator(authenticator, client_id):
+def validate_authenticator(authenticator, client_id, encrypted_authenticator):
     if authenticator.get("client_id") != client_id:
         raise ValueError("Authenticator nao pertence ao mesmo cliente do ticket.")
 
     if not is_timestamp_fresh(authenticator.get("timestamp")):
         raise ValueError("Authenticator antigo ou fora da janela de tempo permitida.")
+
+    reject_replayed_authenticator(encrypted_authenticator)
 
 
 def process_notes_action(client_id, action, note_text):
@@ -87,7 +115,7 @@ def handle_service_request(request):
         client_service_session_key = key_from_text(ticket["client_service_session_key"])
 
         authenticator = decrypt_json(client_service_session_key, encrypted_authenticator)
-        validate_authenticator(authenticator, client_id)
+        validate_authenticator(authenticator, client_id, encrypted_authenticator)
 
         service_request = decrypt_json(client_service_session_key, encrypted_request)
 
